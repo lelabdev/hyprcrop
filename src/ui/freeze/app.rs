@@ -29,7 +29,7 @@ use crate::domain::types::{BorderStyle, LayerSurface, MonitorInfo, ScreenRect, W
 pub enum FreezeSelection {
     /// Crop a rectangular region from the frozen monitor image (crop / monitor modes).
     Region(ScreenRect),
-    /// Capture a specific toplevel window via `hyprland-toplevel-export-v1`.
+    /// Capture a specific window; the compositor backend may use direct export.
     /// Carries full window metadata for title+class matching in the v2 protocol.
     ToplevelWindow(WindowInfo),
 }
@@ -71,7 +71,7 @@ pub struct SelectionCanvas {
     /// Canvas coordinates are local (0,0 = top-left of this monitor).
     /// `canvas_local = global - offset`
     pub monitor_offset: Point,
-    /// Hyprland border style (size + rounding). Applied when drawing and
+    /// Compositor border style (size + rounding). Applied when drawing and
     /// confirming window-mode selections.
     pub border_style: BorderStyle,
     /// User-configured colors for the canvas overlay.
@@ -832,7 +832,7 @@ fn hit_index(
     border_size: u32,
 ) -> Option<usize> {
     let p = pos?;
-    // Convert canvas-local cursor to global for comparison with hyprctl rects
+    // Convert canvas-local cursor to global for comparison with compositor rects
     let gx = p.x + offset.x;
     let gy = p.y + offset.y;
 

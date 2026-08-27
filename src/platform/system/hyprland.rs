@@ -63,6 +63,14 @@ fn hyprland_socket_path() -> Result<PathBuf> {
     Ok(PathBuf::from(format!("/tmp/hypr/{}/.socket.sock", sig)))
 }
 
+/// Return whether Hyprland's IPC socket can be reached without issuing a query.
+pub fn is_available() -> bool {
+    let Ok(path) = hyprland_socket_path() else {
+        return false;
+    };
+    UnixStream::connect(&path).is_ok()
+}
+
 pub fn hyprland_ipc_raw(cmd: &str) -> Result<Vec<u8>> {
     let path = hyprland_socket_path()?;
     const MAX_RETRIES: u32 = 5;

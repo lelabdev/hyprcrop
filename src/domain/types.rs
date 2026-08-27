@@ -6,9 +6,9 @@
 //! | Type | Purpose |
 //! |---|---|
 //! | `ScreenRect` | Rectangular region in logical pixel coordinates |
-//! | `WindowInfo` | Hyprland window metadata |
-//! | `MonitorInfo` | Hyprland monitor metadata |
-//! | `BorderStyle` | Hyprland `border_size` and `rounding` values |
+//! | `WindowInfo` | Compositor window metadata |
+//! | `MonitorInfo` | Compositor monitor metadata |
+//! | `BorderStyle` | Compositor border and rounding values |
 //! | `LayerSurface` | Wayland layer-shell surface descriptor |
 
 use serde::Deserialize;
@@ -44,8 +44,7 @@ pub struct WindowInfo {
     pub floating: bool,
     /// Lower = more recently focused (0 = topmost floating window).
     pub focus_history_id: i64,
-    /// Hyprland window address (from `hyprctl clients`).
-    /// `0` if the address field was missing or unparseable.
+    /// Stable compositor-specific window identifier. `0` when unavailable.
     pub address: u64,
 }
 
@@ -59,9 +58,9 @@ pub struct MonitorInfo {
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct BorderStyle {
-    /// Hyprland `general:border_size` in logical pixels.
+    /// Compositor border size in logical pixels.
     pub border_size: u32,
-    /// Hyprland `decoration:rounding` in logical pixels.
+    /// Compositor corner rounding in logical pixels.
     pub rounding: u32,
 }
 

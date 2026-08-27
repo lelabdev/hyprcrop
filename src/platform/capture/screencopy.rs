@@ -371,7 +371,7 @@ pub type RgbaImage = ImageBuffer<Rgba<u8>, Vec<u8>>;
 
 /// Capture all monitors and composite them into a single image in **logical pixel space**.
 ///
-/// The output dimensions and pixel coordinates match what Hyprland IPC and slurp report,
+/// The output dimensions and pixel coordinates match what compositor IPC and slurp report,
 /// so crop coordinates can be applied directly without coordinate conversion.
 /// HiDPI monitors are downsampled to their logical size during compositing.
 pub fn capture_all_monitors(monitors: &[MonitorInfo]) -> Result<RgbaImage> {
@@ -446,7 +446,7 @@ pub fn capture_all_monitors_with_physical(
 
             if log_w <= 0 || log_h <= 0 {
                 return Err(AppError::Wayland(format!(
-                    "Monitor '{}' has invalid dimensions ({}x{}) in Hyprland IPC data",
+                    "Monitor '{}' has invalid dimensions ({}x{}) in compositor IPC data",
                     mon_info.name, log_w, log_h
                 )));
             }
