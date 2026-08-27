@@ -206,7 +206,9 @@ impl Dispatch<zwlr_screencopy_frame_v1::ZwlrScreencopyFrameV1, ()> for CaptureSt
                         v @ (wl_shm::Format::Argb8888
                         | wl_shm::Format::Xrgb8888
                         | wl_shm::Format::Abgr8888
-                        | wl_shm::Format::Xbgr8888),
+                        | wl_shm::Format::Xbgr8888
+                        | wl_shm::Format::Rgb888
+                        | wl_shm::Format::Bgr888),
                     ) => v,
                     _ => {
                         state.frames[fi_idx].failed = true;
@@ -272,10 +274,11 @@ fn extract_image(fi: &FrameInfo) -> Result<RgbaImage> {
         .format
         .ok_or_else(|| AppError::Screencopy(format!("format not set for monitor '{}'", fi.name)))?;
     let mut img = ImageBuffer::new(fi.width, fi.height);
+    let pixel_size = wl_shared::bytes_per_pixel(format);
     for y in 0..fi.height {
         let row_offset = y as usize * fi.stride as usize;
         for x in 0..fi.width {
-            let offset = row_offset + x as usize * 4;
+            let offset = row_offset + x as usize * pixel_size;
             img.put_pixel(x, y, wl_shared::read_pixel_rgba(mmap, offset, format));
         }
     }
@@ -454,6 +457,7 @@ pub fn capture_all_monitors_with_physical(
             let log_h = log_h as u32;
 
             // Pre-compute the logical→physical index mapping for each axis.
+            let pixel_size = wl_shared::bytes_per_pixel(format);
             let phys_xs: Vec<u32> = (0..log_w)
                 .map(|lx| {
                     ((lx as u64 * fi.width as u64 / log_w as u64) as u32)
@@ -470,7 +474,7 @@ pub fn capture_all_monitors_with_physical(
             for (ly, &py) in phys_ys.iter().enumerate() {
                 let row_offset = py as usize * fi.stride as usize;
                 for (lx, &px) in phys_xs.iter().enumerate() {
-                    let offset = row_offset + px as usize * 4;
+                    let offset = row_offset + px as usize * pixel_size;
                     master_img.put_pixel(
                         offset_x + lx as u32,
                         offset_y + ly as u32,
