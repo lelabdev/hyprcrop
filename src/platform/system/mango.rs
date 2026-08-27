@@ -158,7 +158,7 @@ pub fn get_monitors() -> Result<Vec<MonitorInfo>> {
         .collect())
 }
 
-fn parse_client(client: MangoClient, order: usize, require_visible: bool) -> Option<WindowInfo> {
+fn parse_client(client: MangoClient, require_visible: bool) -> Option<WindowInfo> {
     if require_visible && !client.is_visible {
         return None;
     }
@@ -176,13 +176,9 @@ fn parse_client(client: MangoClient, order: usize, require_visible: bool) -> Opt
         title: client.title,
         class: client.appid,
         floating: client.is_floating,
-        // Mango exposes focus state but not Hyprland's focus-history counter.
-        // Keep the focused client first and retain deterministic order for the rest.
-        focus_history_id: if client.is_focused {
-            0
-        } else {
-            (order as i64).saturating_add(1)
-        },
+        // Mango exposes the focused client but does not expose its fstack order
+        // through IPC. Do not pretend that all-clients order is focus history.
+        focus_history_id: client.is_focused.then_some(0),
         // WindowInfo already has a stable numeric identifier suitable for
         // compositor-specific backends.  It is not used by Mango's fallback
         // screencopy path.
@@ -196,15 +192,14 @@ pub fn get_clients() -> Result<Vec<WindowInfo>> {
     Ok(response
         .clients
         .into_iter()
-        .enumerate()
-        .filter_map(|(order, client)| parse_client(client, order, true))
+        .filter_map(|client| parse_client(client, true))
         .collect())
 }
 
 pub fn get_active_window() -> Result<WindowInfo> {
     let client: MangoClient =
         parse_response("get focusing-client", ipc_json("get focusing-client")?)?;
-    parse_client(client, 0, false).ok_or_else(|| {
+    parse_client(client, false).ok_or_else(|| {
         AppError::CompositorProtocol("focused Mango client has invalid geometry".to_owned())
     })
 }
@@ -251,7 +246,9 @@ mod tests {
             "clients": [
                 {"id": 7, "title": "focused", "appid": "kitty", "x": 0, "y": 0,
                  "width": 800, "height": 600, "is_visible": true, "is_focused": true},
-                {"id": 8, "title": "hidden", "appid": "firefox", "x": 0, "y": 0,
+                {"id": 8, "title": "unfocused", "appid": "firefox", "x": 0, "y": 0,
+                 "width": 800, "height": 600, "is_visible": true, "is_focused": false},
+                {"id": 9, "title": "hidden", "appid": "foot", "x": 0, "y": 0,
                  "width": 800, "height": 600, "is_visible": false, "is_focused": false}
             ]
         });
@@ -259,12 +256,13 @@ mod tests {
         let windows: Vec<_> = response
             .clients
             .into_iter()
-            .enumerate()
-            .filter_map(|(i, client)| parse_client(client, i, true))
+            .filter_map(|client| parse_client(client, true))
             .collect();
-        assert_eq!(windows.len(), 1);
+        assert_eq!(windows.len(), 2);
         assert_eq!(windows[0].class, "kitty");
         assert_eq!(windows[0].address, 7);
-        assert_eq!(windows[0].focus_history_id, 0);
+        assert_eq!(windows[0].focus_history_id, Some(0));
+        assert_eq!(windows[1].class, "firefox");
+        assert_eq!(windows[1].focus_history_id, None);
     }
 }

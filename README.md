@@ -155,11 +155,16 @@ back to Wayland screencopy cropping.
 | :------ | :------: | :------: |
 | crop / monitor / all | ✅ | ✅ |
 | active window | ✅ | ✅ |
-| freeze selection | ✅ | ✅ |
+| freeze selection | ✅ | ✅* |
 | direct window capture | Hyprland export | screencopy fallback |
-| portal capture | ✅ | ✅* |
+| portal capture | ✅ | ✅** |
 
-\* Portal availability depends on the installed desktop portal.
+\* MangoWM does not currently expose layer-shell geometry or complete fstack
+ordering through IPC. Freeze Mode uses visible clients and the focused-client
+signal; overlapping unfocused windows may therefore be ambiguous, and panels
+are not separately hit-tested.
+
+\*\* Portal availability depends on the installed desktop portal.
 
 ## Configuration
 

@@ -63,7 +63,7 @@ impl CompositorBackend for Backend {
                     title: String::new(),
                     class: String::new(),
                     floating: false,
-                    focus_history_id: 0,
+                    focus_history_id: Some(0),
                     address: 0,
                 })
             }
@@ -126,16 +126,20 @@ pub fn detect() -> Result<Backend> {
         )));
     }
 
-    if hyprland::is_available() {
-        return Ok(Backend::Hyprland);
-    }
-    if mango::is_available() {
-        return Ok(Backend::Mango);
-    }
+    let hyprland_available = hyprland::is_available();
+    let mango_available = mango::is_available();
 
-    Err(AppError::UnsupportedCompositor(
-        "no supported compositor detected (expected Hyprland or MangoWM)".to_owned(),
-    ))
+    match (hyprland_available, mango_available) {
+        (true, false) => Ok(Backend::Hyprland),
+        (false, true) => Ok(Backend::Mango),
+        (true, true) => Err(AppError::UnsupportedCompositor(
+            "both Hyprland and MangoWM IPC sockets are reachable; set HYPRCROP_COMPOSITOR to choose one"
+                .to_owned(),
+        )),
+        (false, false) => Err(AppError::UnsupportedCompositor(
+            "no supported compositor detected (expected Hyprland or MangoWM)".to_owned(),
+        )),
+    }
 }
 
 fn is_available(backend: Backend) -> bool {

@@ -271,7 +271,7 @@ pub(crate) fn parse_windows(
                 title: c.title,
                 class: c.class,
                 floating: c.floating,
-                focus_history_id: c.focus_history_id,
+                focus_history_id: Some(c.focus_history_id),
                 address,
             })
         })

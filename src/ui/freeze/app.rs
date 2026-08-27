@@ -835,7 +835,8 @@ fn hit_index(
     let gy = p.y + offset.y;
 
     // Single pass: floating windows sort before tiled (!floating = false < true),
-    // then by focus_history_id ascending (0 = most recently focused = topmost).
+    // then by compositor-provided focus order. Mango may not provide a complete
+    // stack order, so windows without one retain the backend's enumeration order.
     windows
         .iter()
         .enumerate()
@@ -846,7 +847,7 @@ fn hit_index(
                 && gy >= r.y as f32
                 && gy < (r.y + r.h) as f32
         })
-        .min_by_key(|(_, w)| (!w.floating, w.focus_history_id))
+        .min_by_key(|(index, w)| (!w.floating, w.focus_history_id.unwrap_or(i64::MAX), *index))
         .map(|(i, _)| i)
 }
 

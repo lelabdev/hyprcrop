@@ -42,8 +42,9 @@ pub struct WindowInfo {
     /// Used to match `zwlr_foreign_toplevel_handle_v1` when capturing via v2 protocol.
     pub class: String,
     pub floating: bool,
-    /// Lower = more recently focused (0 = topmost floating window).
-    pub focus_history_id: i64,
+    /// Lower = more recently focused (0 = topmost floating window). `None`
+    /// means the compositor did not provide a focus/stack order.
+    pub focus_history_id: Option<i64>,
     /// Stable compositor-specific window identifier. `0` when unavailable.
     pub address: u64,
 }
