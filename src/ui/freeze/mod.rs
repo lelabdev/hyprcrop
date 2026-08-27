@@ -40,18 +40,12 @@ pub fn run_freeze(cfg: &Config) -> Result<PathBuf> {
 
     // Fetch compositor data in parallel threads for speed.  At most 3 concurrent
     // IPC requests are made; border style is fetched after joining.
-    let monitors_t = std::thread::spawn({
-        let backend = backend;
-        move || backend.monitors()
-    });
-    let clients_t = std::thread::spawn({
-        let backend = backend;
-        move || backend.windows()
-    });
-    let layers_t = std::thread::spawn({
-        let backend = backend;
-        move || backend.overlay_layers()
-    });
+    let monitors_backend = backend;
+    let monitors_t = std::thread::spawn(move || monitors_backend.monitors());
+    let clients_backend = backend;
+    let clients_t = std::thread::spawn(move || clients_backend.windows());
+    let layers_backend = backend;
+    let layers_t = std::thread::spawn(move || layers_backend.overlay_layers());
 
     let monitors = monitors_t
         .join()

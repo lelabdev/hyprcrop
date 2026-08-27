@@ -146,11 +146,9 @@ impl canvas::Program<Message> for SelectionCanvas {
                 }
             }
 
-            canvas::Event::Mouse(mouse::Event::CursorLeft) => {
-                if state.hovered.is_some() {
-                    state.hovered = None;
-                    return Some(canvas::Action::request_redraw());
-                }
+            canvas::Event::Mouse(mouse::Event::CursorLeft) if state.hovered.is_some() => {
+                state.hovered = None;
+                return Some(canvas::Action::request_redraw());
             }
 
             canvas::Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)) => {
