@@ -24,7 +24,10 @@ use iced_layershell::{
 use std::{
     collections::HashMap,
     path::PathBuf,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 
 use crate::domain::config::Config;
@@ -37,6 +40,12 @@ use crate::platform::system::compositor::{self, CompositorBackend, CompositorKin
 
 pub fn run_freeze(cfg: &Config) -> Result<PathBuf> {
     let backend = compositor::detect()?;
+
+    // iced builds its system font database lazily on the first text layout, which
+    // scans every installed font and can take hundreds of milliseconds. Do it while
+    // the screen is being captured instead of on the overlay's critical path; views
+    // omit text until this flag flips (see `AppState::text_ready`).
+    let fonts_ready = spawn_font_warmup();
 
     // Fetch compositor data in parallel threads for speed.  At most 3 concurrent
     // IPC requests are made; border style is fetched after joining.
@@ -162,6 +171,7 @@ pub fn run_freeze(cfg: &Config) -> Result<PathBuf> {
                     initial_mode,
                     colors,
                     freeze_buttons,
+                    fonts_ready: Arc::clone(&fonts_ready),
                 });
                 (state, Task::batch(spawn_tasks))
             },
@@ -240,6 +250,36 @@ pub fn run_freeze(cfg: &Config) -> Result<PathBuf> {
     }
 }
 
+/// Load iced's system font database ahead of the first text layout.
+///
+/// `iced_graphics` builds cosmic-text's font database lazily on the first call to
+/// `font_system()`, which scans every installed font. That scan is usually around
+/// 100 ms and can take seconds on a cold page cache with large font collections.
+/// Starting it on a background thread lets it overlap screenshot capture, while
+/// `AppState::text_ready` keeps views from shaping text until it completes.
+fn spawn_font_warmup() -> Arc<AtomicBool> {
+    spawn_warmup(|| {
+        let _ = iced::advanced::graphics::text::font_system();
+    })
+}
+
+/// Run `init` on a background thread and expose completion through a flag.
+///
+/// Kept generic so orchestration can be tested without paying for a real font
+/// scan in the unit test suite.
+fn spawn_warmup(init: impl FnOnce() + Send + 'static) -> Arc<AtomicBool> {
+    let ready = Arc::new(AtomicBool::new(false));
+    let flag = Arc::clone(&ready);
+    std::thread::spawn(move || {
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(init));
+        if outcome.is_err() {
+            eprintln!("[hyprcrop] warning: font warm-up panicked");
+        }
+        flag.store(true, Ordering::Release);
+    });
+    ready
+}
+
 fn resolve_initial_mode(
     buttons: &crate::domain::config::FreezeButtons,
     saved: CaptureMode,
@@ -267,5 +307,49 @@ fn resolve_initial_mode(
         // interactions (drag-to-select region) remain available even when the
         // toolbar is hidden or cancel-only.
         CaptureMode::Crop
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::mpsc;
+    use std::time::{Duration, Instant};
+
+    fn wait_until(flag: &AtomicBool) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !flag.load(Ordering::Acquire) {
+            assert!(Instant::now() < deadline, "warm-up flag never became ready");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    #[test]
+    fn warmup_flips_ready_only_after_init_finishes() {
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+
+        let ready = spawn_warmup(move || {
+            started_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+        });
+
+        started_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("warm-up thread must start");
+        assert!(
+            !ready.load(Ordering::Acquire),
+            "ready must stay false while init runs"
+        );
+
+        release_tx.send(()).unwrap();
+        wait_until(&ready);
+    }
+
+    #[test]
+    fn warmup_marks_ready_even_if_init_panics() {
+        let ready = spawn_warmup(|| panic!("simulated font scan failure"));
+
+        wait_until(&ready);
     }
 }
