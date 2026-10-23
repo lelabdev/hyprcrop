@@ -84,13 +84,17 @@ pub fn run_freeze(cfg: &Config) -> Result<PathBuf> {
     // Using one session guarantees the overlay images and the final-crop source are
     // from the same frame — two separate captures would differ in time, breaking
     // the "freeze" guarantee (user selects based on a different frame than what gets saved).
-    let (physical_per_monitor, full_rgba) =
-        screencopy::capture_all_monitors_with_physical(&monitors)?;
+    let captured = screencopy::capture_all_monitors_physical(&monitors)?;
 
-    let monitor_images: Vec<iced_image::Handle> = physical_per_monitor
+    // Move the physical RGBA buffers into iced handles. Keep a cheap clone of the
+    // handles (the pixel data is shared behind an `Arc`), so the final save can
+    // reuse exactly the same frame without duplicating it.
+    let monitor_images: Vec<iced_image::Handle> = captured
         .into_iter()
-        .map(|img| iced_image::Handle::from_rgba(img.width(), img.height(), img.into_raw()))
+        .map(|frame| iced_image::Handle::from_rgba(frame.width, frame.height, frame.pixels))
         .collect();
+    let saved_images = monitor_images.clone();
+    let save_monitors = monitors.clone();
 
     let focused_monitor_idx = monitors.iter().position(|m| m.focused).unwrap_or(0);
 
@@ -189,11 +193,16 @@ pub fn run_freeze(cfg: &Config) -> Result<PathBuf> {
 
     let out_path = cfg.output_path();
 
+    // Borrow the exact pixels that were shown in the overlay. The composite is
+    // built only for the selected region and only after the user has chosen.
+    let frames: Vec<screencopy::FrameRef<'_>> =
+        saved_images.iter().map(frame_ref).collect::<Result<_>>()?;
+
     match selected {
         None => Err(AppError::UserCancelled),
         Some(None) => {
             // "All" mode: save the full frozen image.
-            screencopy::crop_and_save(full_rgba, None, &out_path)?;
+            screencopy::save_composed_region(&save_monitors, &frames, None, &out_path)?;
             Ok(out_path)
         }
         Some(Some(FreezeSelection::Region(r))) => {
@@ -205,7 +214,7 @@ pub fn run_freeze(cfg: &Config) -> Result<PathBuf> {
                 w: r.w,
                 h: r.h,
             };
-            screencopy::crop_and_save(full_rgba, Some(adjusted), &out_path)?;
+            screencopy::save_composed_region(&save_monitors, &frames, Some(adjusted), &out_path)?;
             Ok(out_path)
         }
         Some(Some(FreezeSelection::ToplevelWindow(window))) => {
@@ -233,10 +242,37 @@ pub fn run_freeze(cfg: &Config) -> Result<PathBuf> {
                     h: window.rect.h,
                 }
                 .expand(border_style.border_size);
-                screencopy::crop_and_save(full_rgba, Some(adjusted), &out_path)?;
+                screencopy::save_composed_region(
+                    &save_monitors,
+                    &frames,
+                    Some(adjusted),
+                    &out_path,
+                )?;
             }
             Ok(out_path)
         }
+    }
+}
+
+/// Borrow raw RGBA pixels from an iced image handle.
+///
+/// `Handle::Rgba` stores the same `Bytes` buffer that the renderer uploads, so
+/// the save path can reuse it without copying.
+fn frame_ref(handle: &iced_image::Handle) -> Result<screencopy::FrameRef<'_>> {
+    match handle {
+        iced_image::Handle::Rgba {
+            width,
+            height,
+            pixels,
+            ..
+        } => Ok(screencopy::FrameRef {
+            width: *width,
+            height: *height,
+            pixels: pixels.as_ref(),
+        }),
+        _ => Err(AppError::Other(
+            "freeze capture produced a non-RGBA image handle".to_string(),
+        )),
     }
 }
 
