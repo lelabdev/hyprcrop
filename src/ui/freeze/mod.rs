@@ -30,29 +30,77 @@ use std::{
 use crate::domain::config::Config;
 use crate::domain::constants::FREEZE_LAYER_NAMESPACE;
 use crate::domain::error::{AppError, Result};
-use crate::domain::types::{BorderStyle, ScreenRect};
+use crate::domain::types::{BorderStyle, LayerSurface, MonitorInfo, ScreenRect, WindowInfo};
 use crate::platform::capture::screencopy;
 use crate::platform::capture::toplevel_export;
 use crate::platform::system::compositor::{self, CompositorBackend, CompositorKind};
 
-pub fn run_freeze(cfg: &Config) -> Result<PathBuf> {
-    let backend = compositor::detect()?;
+/// Compositor data and the single frozen frame used by the overlay.
+#[derive(Debug)]
+struct FreezeScene {
+    monitors: Vec<MonitorInfo>,
+    windows: Vec<WindowInfo>,
+    layers: Vec<LayerSurface>,
+    border_style: BorderStyle,
+    physical_per_monitor: Vec<screencopy::RgbaImage>,
+    full_rgba: screencopy::RgbaImage,
+}
 
-    // Fetch compositor data in parallel threads for speed.  At most 3 concurrent
-    // IPC requests are made; border style is fetched after joining.
-    let monitors_backend = backend;
-    let monitors_t = std::thread::spawn(move || monitors_backend.monitors());
-    let clients_backend = backend;
-    let clients_t = std::thread::spawn(move || clients_backend.windows());
-    let layers_backend = backend;
-    let layers_t = std::thread::spawn(move || layers_backend.overlay_layers());
+/// Fetch compositor scene data and start the screenshot session as early as possible.
+///
+/// Monitor/output identifiers are the only data the Wayland capture needs, so the
+/// capture is started immediately after `monitors_fn` completes. Window, layer and
+/// border queries overlap with the capture instead of delaying it. The capture is
+/// still a single session, so the overlay and the final crop share one frame.
+///
+/// The border query starts after monitor discovery to keep the number of concurrent
+/// compositor IPC connections at most three; Hyprland has dropped connections when
+/// too many sockets were opened at once.
+fn prefetch_scene<M, W, L, B, C>(
+    monitors_fn: M,
+    windows_fn: W,
+    layers_fn: L,
+    border_style_fn: Option<B>,
+    capture_fn: C,
+) -> Result<FreezeScene>
+where
+    M: FnOnce() -> Result<Vec<MonitorInfo>> + Send + 'static,
+    W: FnOnce() -> Result<Vec<WindowInfo>> + Send + 'static,
+    L: FnOnce() -> Result<Vec<LayerSurface>> + Send + 'static,
+    B: FnOnce() -> BorderStyle + Send + 'static,
+    C: FnOnce(Vec<MonitorInfo>) -> Result<(Vec<screencopy::RgbaImage>, screencopy::RgbaImage)>
+        + Send
+        + 'static,
+{
+    let monitors_t = std::thread::spawn(monitors_fn);
+    let windows_t = std::thread::spawn(windows_fn);
+    let layers_t = std::thread::spawn(layers_fn);
 
-    let monitors = monitors_t
+    let monitors = match monitors_t.join() {
+        Ok(Ok(monitors)) => monitors,
+        Ok(Err(err)) => {
+            // Capture cannot start without output identifiers; still join the
+            // other queries so no worker is left detached.
+            let _ = windows_t.join();
+            let _ = layers_t.join();
+            return Err(err);
+        }
+        Err(_) => {
+            let _ = windows_t.join();
+            let _ = layers_t.join();
+            return Err(AppError::Other("monitors thread panicked".into()));
+        }
+    };
+
+    let border_t = border_style_fn.map(std::thread::spawn);
+    let capture_monitors = monitors.clone();
+    let capture_t = std::thread::spawn(move || capture_fn(capture_monitors));
+
+    // Join every worker before propagating an error, otherwise a failing IPC
+    // query would leave the capture thread running detached.
+    let windows_result = windows_t
         .join()
-        .map_err(|_| AppError::Other("monitors thread panicked".into()))??;
-    let windows = clients_t
-        .join()
-        .map_err(|_| AppError::Other("clients thread panicked".into()))??;
+        .map_err(|_| AppError::Other("windows thread panicked".into()));
     let layers = layers_t
         .join()
         .unwrap_or_else(|_| {
@@ -63,15 +111,53 @@ pub fn run_freeze(cfg: &Config) -> Result<PathBuf> {
             eprintln!("[hyprcrop] warning: failed to fetch overlay layers: {e}");
             Vec::new()
         });
+    let border_style = match border_t {
+        Some(handle) => handle.join().unwrap_or_else(|_| {
+            eprintln!("[hyprcrop] warning: border style thread panicked");
+            BorderStyle::default()
+        }),
+        None => BorderStyle::default(),
+    };
+    let capture_result = capture_t
+        .join()
+        .map_err(|_| AppError::Other("capture thread panicked".into()));
+
+    let windows = windows_result??;
+    let (physical_per_monitor, full_rgba) = capture_result??;
+
+    Ok(FreezeScene {
+        monitors,
+        windows,
+        layers,
+        border_style,
+        physical_per_monitor,
+        full_rgba,
+    })
+}
+
+pub fn run_freeze(cfg: &Config) -> Result<PathBuf> {
+    let backend = compositor::detect()?;
 
     // Border expansion is irrelevant when toplevel-export is used (the protocol
     // captures the raw window surface, no compositor decorations). Suppress it here
     // rather than mutating the global config flag, so non-freeze commands are unaffected.
-    let border_style = if cfg.capture_window_border {
-        backend.border_style()
-    } else {
-        BorderStyle::default()
-    };
+    let scene = prefetch_scene(
+        move || backend.monitors(),
+        move || backend.windows(),
+        move || backend.overlay_layers(),
+        cfg.capture_window_border
+            .then_some(move || backend.border_style()),
+        move |monitors| screencopy::capture_all_monitors_with_physical(&monitors),
+    )?;
+    let FreezeScene {
+        monitors,
+        windows,
+        layers,
+        border_style,
+        physical_per_monitor,
+        full_rgba,
+    } = scene;
+
     let initial_mode =
         resolve_initial_mode(&cfg.freeze_buttons, crate::domain::state::load_last_mode());
 
@@ -79,13 +165,6 @@ pub fn run_freeze(cfg: &Config) -> Result<PathBuf> {
     // capture_all_monitors places (min_x, min_y) at image pixel (0,0); we need this
     // to translate the UI's global logical coordinates into image coordinates later.
     let (min_x, min_y) = crate::domain::geometry::monitor_origin(&monitors);
-
-    // Capture all monitors in a single Wayland session.
-    // Using one session guarantees the overlay images and the final-crop source are
-    // from the same frame — two separate captures would differ in time, breaking
-    // the "freeze" guarantee (user selects based on a different frame than what gets saved).
-    let (physical_per_monitor, full_rgba) =
-        screencopy::capture_all_monitors_with_physical(&monitors)?;
 
     let monitor_images: Vec<iced_image::Handle> = physical_per_monitor
         .into_iter()
@@ -267,5 +346,91 @@ fn resolve_initial_mode(
         // interactions (drag-to-select region) remain available even when the
         // toolbar is hidden or cancel-only.
         CaptureMode::Crop
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    fn monitor(name: &str) -> MonitorInfo {
+        MonitorInfo {
+            rect: ScreenRect {
+                x: 0,
+                y: 0,
+                w: 100,
+                h: 100,
+            },
+            name: name.to_string(),
+            focused: true,
+            active_workspace_id: 1,
+        }
+    }
+
+    fn frame() -> screencopy::RgbaImage {
+        image::RgbaImage::new(1, 1)
+    }
+
+    #[test]
+    fn capture_starts_before_windows_query_completes() {
+        let (capture_started_tx, capture_started_rx) = mpsc::channel();
+        let (windows_done_tx, windows_done_rx) = mpsc::channel();
+
+        let scene = prefetch_scene(
+            || Ok(vec![monitor("eDP-1")]),
+            move || {
+                capture_started_rx
+                    .recv_timeout(Duration::from_secs(5))
+                    .expect("capture must start before the windows query completes");
+                windows_done_tx.send(()).unwrap();
+                Ok(Vec::new())
+            },
+            || Ok(Vec::new()),
+            None::<fn() -> BorderStyle>,
+            move |_monitors| {
+                capture_started_tx.send(()).unwrap();
+                windows_done_rx
+                    .recv_timeout(Duration::from_secs(5))
+                    .expect("windows query must overlap the capture");
+                Ok((vec![frame()], frame()))
+            },
+        )
+        .expect("prefetch should succeed");
+
+        assert_eq!(scene.monitors.len(), 1);
+        assert_eq!(scene.physical_per_monitor.len(), 1);
+    }
+
+    #[test]
+    fn layer_query_errors_do_not_abort_capture() {
+        let scene = prefetch_scene(
+            || Ok(vec![monitor("eDP-1")]),
+            || Ok(Vec::new()),
+            || Err(AppError::Other("layers unavailable".into())),
+            None::<fn() -> BorderStyle>,
+            |_| Ok((vec![frame()], frame())),
+        )
+        .expect("layer errors are non-fatal");
+
+        assert!(scene.layers.is_empty());
+        assert_eq!(scene.physical_per_monitor.len(), 1);
+    }
+
+    #[test]
+    fn monitor_failure_prevents_capture_and_propagates() {
+        let err = prefetch_scene(
+            || Err(AppError::Other("no monitors".into())),
+            || Ok(Vec::new()),
+            || Ok(Vec::new()),
+            None::<fn() -> BorderStyle>,
+            |_| -> Result<(Vec<screencopy::RgbaImage>, screencopy::RgbaImage)> {
+                panic!("capture must not start without monitor identifiers");
+            },
+        )
+        .unwrap_err();
+
+        assert!(matches!(err, AppError::Other(_)));
     }
 }
