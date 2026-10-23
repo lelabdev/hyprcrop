@@ -1,4 +1,5 @@
 use std::{
+    cell::Cell,
     collections::HashMap,
     sync::{Arc, Mutex},
 };
@@ -89,6 +90,39 @@ pub struct CanvasState {
     phase: DrawPhase,
     cursor: Point,
     hovered: Option<HoveredTarget>,
+    /// Cached canvas geometry.
+    ///
+    /// iced's canvas always registers a text group when the geometry is live,
+    /// even when it contains no text, and iced_wgpu initialises the (expensive)
+    /// system font database before inspecting that group. Caching keeps the
+    /// first frames text-free so the frozen image can present before the font
+    /// scan finishes; labels are drawn once `text_ready` flips.
+    cache: canvas::Cache,
+    /// Inputs that invalidate the cached geometry when they change.
+    last_mode: Cell<Option<CaptureMode>>,
+    last_text_ready: Cell<Option<bool>>,
+}
+
+impl CanvasState {
+    /// Clears the cached geometry when a drawing input changed.
+    ///
+    /// Returns `true` when the cache was invalidated.
+    fn invalidate_if_needed(&self, mode: CaptureMode, text_ready: bool) -> bool {
+        let mut invalidated = false;
+
+        if self.last_mode.get() != Some(mode) {
+            self.cache.clear();
+            self.last_mode.set(Some(mode));
+            invalidated = true;
+        }
+        if self.last_text_ready.get() != Some(text_ready) {
+            self.cache.clear();
+            self.last_text_ready.set(Some(text_ready));
+            invalidated = true;
+        }
+
+        invalidated
+    }
 }
 
 #[derive(Default)]
@@ -119,6 +153,7 @@ impl canvas::Program<Message> for SelectionCanvas {
                 }
                 match &state.phase {
                     DrawPhase::Cropping { .. } => {
+                        state.cache.clear();
                         return Some(canvas::Action::request_redraw());
                     }
                     DrawPhase::Idle => {
@@ -145,6 +180,7 @@ impl canvas::Program<Message> for SelectionCanvas {
                             _ => None,
                         };
                         if state.hovered != prev {
+                            state.cache.clear();
                             return Some(canvas::Action::request_redraw());
                         }
                     }
@@ -153,6 +189,7 @@ impl canvas::Program<Message> for SelectionCanvas {
 
             canvas::Event::Mouse(mouse::Event::CursorLeft) if state.hovered.is_some() => {
                 state.hovered = None;
+                state.cache.clear();
                 return Some(canvas::Action::request_redraw());
             }
 
@@ -161,6 +198,7 @@ impl canvas::Program<Message> for SelectionCanvas {
                     CaptureMode::Crop => {
                         if let Some(p) = pos {
                             state.phase = DrawPhase::Cropping { start: p };
+                            state.cache.clear();
                             return Some(canvas::Action::request_redraw().and_capture());
                         }
                     }
@@ -198,6 +236,7 @@ impl canvas::Program<Message> for SelectionCanvas {
             canvas::Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)) => {
                 if let DrawPhase::Cropping { start } = state.phase {
                     state.phase = DrawPhase::Idle;
+                    state.cache.clear();
                     let local_rect = points_to_rect(start, state.cursor);
                     if local_rect.w >= 5 && local_rect.h >= 5 {
                         // Convert canvas-local coords to global logical space for crop
@@ -230,75 +269,82 @@ impl canvas::Program<Message> for SelectionCanvas {
         bounds: Rectangle,
         _cursor: mouse::Cursor,
     ) -> Vec<canvas::Geometry<iced::Renderer>> {
-        let mut frame = canvas::Frame::new(renderer, bounds.size());
+        // Invalidate the cache when anything the drawing depends on changes.
+        // `text_ready` flips when the background font scan finishes, at which
+        // point labels may be added. Returns a *cached* geometry: unlike a live
+        // geometry, it emits no empty text group, so the first frames do not
+        // initialise the font database.
+        state.invalidate_if_needed(self.mode, self.text_ready);
 
-        frame.fill(
-            &canvas::Path::rectangle(Point::ORIGIN, bounds.size()),
-            to_iced(self.colors.overlay.background),
-        );
+        let geometry = state.cache.draw(renderer, bounds.size(), |frame| {
+            frame.fill(
+                &canvas::Path::rectangle(Point::ORIGIN, bounds.size()),
+                to_iced(self.colors.overlay.background),
+            );
 
-        match self.mode {
-            CaptureMode::Crop => {
-                if let DrawPhase::Cropping { start } = state.phase {
-                    draw_selection(
-                        &mut frame,
-                        start,
-                        state.cursor,
-                        &self.colors.crop_frame,
-                        self.text_ready,
-                    );
+            match self.mode {
+                CaptureMode::Crop => {
+                    if let DrawPhase::Cropping { start } = state.phase {
+                        draw_selection(
+                            frame,
+                            start,
+                            state.cursor,
+                            &self.colors.crop_frame,
+                            self.text_ready,
+                        );
+                    }
                 }
+                CaptureMode::Window => {
+                    let show_text = self.text_ready;
+                    for (i, win) in self.windows.iter().enumerate() {
+                        draw_highlight(
+                            frame,
+                            win.rect,
+                            state.hovered == Some(HoveredTarget::Window(i)),
+                            if show_text { win.title.as_str() } else { "" },
+                            self.monitor_offset,
+                            self.border_style,
+                            &self.colors.window_frame,
+                        );
+                    }
+                    // Layer surfaces are at overlay level — draw on top of windows
+                    for (i, layer) in self.layers.iter().enumerate() {
+                        draw_highlight(
+                            frame,
+                            layer.rect,
+                            state.hovered == Some(HoveredTarget::Layer(i)),
+                            if show_text {
+                                layer.namespace.as_str()
+                            } else {
+                                ""
+                            },
+                            self.monitor_offset,
+                            BorderStyle::default(),
+                            &self.colors.window_frame,
+                        );
+                    }
+                }
+                CaptureMode::Monitor => {
+                    for (i, mon) in self.monitors.iter().enumerate() {
+                        draw_monitor_highlight(
+                            frame,
+                            mon.rect,
+                            state.hovered == Some(HoveredTarget::Monitor(i)),
+                            if self.text_ready {
+                                mon.name.as_str()
+                            } else {
+                                ""
+                            },
+                            self.monitor_offset,
+                            &self.colors.monitor_frame,
+                        );
+                    }
+                }
+                CaptureMode::All => {}
             }
-            CaptureMode::Window => {
-                let show_text = self.text_ready;
-                for (i, win) in self.windows.iter().enumerate() {
-                    draw_highlight(
-                        &mut frame,
-                        win.rect,
-                        state.hovered == Some(HoveredTarget::Window(i)),
-                        if show_text { win.title.as_str() } else { "" },
-                        self.monitor_offset,
-                        self.border_style,
-                        &self.colors.window_frame,
-                    );
-                }
-                // Layer surfaces are at overlay level — draw on top of windows
-                for (i, layer) in self.layers.iter().enumerate() {
-                    draw_highlight(
-                        &mut frame,
-                        layer.rect,
-                        state.hovered == Some(HoveredTarget::Layer(i)),
-                        if show_text {
-                            layer.namespace.as_str()
-                        } else {
-                            ""
-                        },
-                        self.monitor_offset,
-                        BorderStyle::default(),
-                        &self.colors.window_frame,
-                    );
-                }
-            }
-            CaptureMode::Monitor => {
-                for (i, mon) in self.monitors.iter().enumerate() {
-                    draw_monitor_highlight(
-                        &mut frame,
-                        mon.rect,
-                        state.hovered == Some(HoveredTarget::Monitor(i)),
-                        if self.text_ready {
-                            mon.name.as_str()
-                        } else {
-                            ""
-                        },
-                        self.monitor_offset,
-                        &self.colors.monitor_frame,
-                    );
-                }
-            }
-            CaptureMode::All => {}
-        }
+        });
 
-        vec![frame.into_geometry()]
+        vec![geometry]
     }
 
     fn mouse_interaction(
@@ -1024,5 +1070,28 @@ mod tests {
             state.repaint_ticks, 0,
             "no frames are needed for text that cannot be shaped"
         );
+    }
+
+    #[test]
+    fn canvas_cache_invalidates_only_when_drawing_inputs_change() {
+        let state = CanvasState::default();
+
+        assert!(
+            state.invalidate_if_needed(CaptureMode::Crop, false),
+            "the first draw must populate the cache"
+        );
+        assert!(
+            !state.invalidate_if_needed(CaptureMode::Crop, false),
+            "unchanged inputs must reuse the cached geometry"
+        );
+        assert!(
+            state.invalidate_if_needed(CaptureMode::Window, false),
+            "a mode change must invalidate the cache"
+        );
+        assert!(
+            state.invalidate_if_needed(CaptureMode::Window, true),
+            "font readiness must invalidate the cache so labels appear"
+        );
+        assert!(!state.invalidate_if_needed(CaptureMode::Window, true));
     }
 }
