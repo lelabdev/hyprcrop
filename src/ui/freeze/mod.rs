@@ -24,7 +24,10 @@ use iced_layershell::{
 use std::{
     collections::HashMap,
     path::PathBuf,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicU8, Ordering},
+    },
 };
 
 use crate::domain::config::Config;
@@ -37,6 +40,12 @@ use crate::platform::system::compositor::{self, CompositorBackend, CompositorKin
 
 pub fn run_freeze(cfg: &Config) -> Result<PathBuf> {
     let backend = compositor::detect()?;
+
+    // iced builds its system font database lazily on the first text layout, which
+    // scans every installed font. Do it while the screen is being captured instead
+    // of on the overlay's critical path; views omit text until this flag flips
+    // (see `AppState::text_ready`).
+    let fonts = FontWarmup::spawn();
 
     // Fetch compositor data in parallel threads for speed.  At most 3 concurrent
     // IPC requests are made; border style is fetched after joining.
@@ -162,6 +171,7 @@ pub fn run_freeze(cfg: &Config) -> Result<PathBuf> {
                     initial_mode,
                     colors,
                     freeze_buttons,
+                    fonts: fonts.clone(),
                 });
                 (state, Task::batch(spawn_tasks))
             },
@@ -240,6 +250,93 @@ pub fn run_freeze(cfg: &Config) -> Result<PathBuf> {
     }
 }
 
+/// Lifecycle of iced's lazily-built system font database.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FontStatus {
+    /// The scan is still running; text must not be shaped yet.
+    Pending,
+    /// The database is usable.
+    Ready,
+    /// The scan panicked. Text shaping is unsafe, so text widgets stay disabled
+    /// for the rest of the session instead of retrying in a possibly poisoned
+    /// state.
+    Failed,
+}
+
+impl FontStatus {
+    fn from_u8(value: u8) -> Self {
+        match value {
+            1 => Self::Ready,
+            2 => Self::Failed,
+            _ => Self::Pending,
+        }
+    }
+}
+
+/// Background warm-up of iced's system font database.
+///
+/// `iced_graphics` builds cosmic-text's font database lazily on the first call to
+/// `font_system()`, which scans every installed font. That scan is usually around
+/// 100 ms and can take seconds on a cold page cache with large font collections.
+/// Starting it on a background thread lets it overlap screenshot capture, while
+/// `AppState::text_ready` keeps views from shaping text until it completes.
+#[derive(Debug, Clone)]
+pub(crate) struct FontWarmup {
+    state: Arc<AtomicU8>,
+}
+
+impl FontWarmup {
+    /// Start the scan on a background thread.
+    fn spawn() -> Self {
+        Self::spawn_with(|| {
+            let _ = iced::advanced::graphics::text::font_system();
+        })
+    }
+
+    /// Run `init` on a background thread and publish the resulting status.
+    ///
+    /// Kept generic so orchestration can be tested without paying for a real font
+    /// scan in the unit test suite.
+    fn spawn_with(init: impl FnOnce() + Send + 'static) -> Self {
+        let state = Arc::new(AtomicU8::new(FontStatus::Pending as u8));
+        let shared = Arc::clone(&state);
+        std::thread::spawn(move || {
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(init));
+            let next = match outcome {
+                Ok(()) => FontStatus::Ready,
+                Err(_) => {
+                    eprintln!(
+                        "[hyprcrop] warning: font warm-up failed; freeze overlay text stays disabled"
+                    );
+                    FontStatus::Failed
+                }
+            };
+            shared.store(next as u8, Ordering::Release);
+        });
+        Self { state }
+    }
+
+    fn status(&self) -> FontStatus {
+        FontStatus::from_u8(self.state.load(Ordering::Acquire))
+    }
+
+    fn is_ready(&self) -> bool {
+        self.status() == FontStatus::Ready
+    }
+
+    #[cfg(test)]
+    fn with_status(status: FontStatus) -> Self {
+        Self {
+            state: Arc::new(AtomicU8::new(status as u8)),
+        }
+    }
+
+    #[cfg(test)]
+    fn set_status(&self, status: FontStatus) {
+        self.state.store(status as u8, Ordering::Release);
+    }
+}
+
 fn resolve_initial_mode(
     buttons: &crate::domain::config::FreezeButtons,
     saved: CaptureMode,
@@ -267,5 +364,58 @@ fn resolve_initial_mode(
         // interactions (drag-to-select region) remain available even when the
         // toolbar is hidden or cancel-only.
         CaptureMode::Crop
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::mpsc;
+    use std::time::{Duration, Instant};
+
+    fn wait_for_status(warmup: &FontWarmup, expected: FontStatus) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while warmup.status() == FontStatus::Pending {
+            assert!(
+                Instant::now() < deadline,
+                "warm-up status never left Pending"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(warmup.status(), expected);
+    }
+
+    #[test]
+    fn warmup_becomes_ready_only_after_init_finishes() {
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+
+        let warmup = FontWarmup::spawn_with(move || {
+            started_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+        });
+
+        started_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("warm-up thread must start");
+        assert_eq!(
+            warmup.status(),
+            FontStatus::Pending,
+            "status must stay Pending while init runs"
+        );
+
+        release_tx.send(()).unwrap();
+        wait_for_status(&warmup, FontStatus::Ready);
+    }
+
+    #[test]
+    fn warmup_reports_failure_instead_of_ready() {
+        let warmup = FontWarmup::spawn_with(|| panic!("simulated font scan failure"));
+
+        wait_for_status(&warmup, FontStatus::Failed);
+        assert!(
+            !warmup.is_ready(),
+            "a failed font scan must never be reported as ready"
+        );
     }
 }
